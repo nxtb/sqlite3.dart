@@ -25,6 +25,6 @@ flutter:
       macos:
         pluginClass: Sqlite3FlutterLibsPlugin
       linux:
-        pluginClass: Sqlite3FlutterLibsPlugin
+        ffiPlugin: true
       windows:
-        pluginClass: Sqlite3FlutterLibsPlugin
+        ffiPlugin: true
