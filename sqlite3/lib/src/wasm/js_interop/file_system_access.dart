@@ -132,7 +132,7 @@ extension FileSystemFileSyncAccessHandleApi on FileSystemSyncAccessHandle {
   external void close();
 
   @JS()
-  external void flush();
+  external void $flush();
 
   @JS()
   external int read(TypedData buffer, [FileSystemReadWriteOptions? options]);
@@ -140,9 +140,24 @@ extension FileSystemFileSyncAccessHandleApi on FileSystemSyncAccessHandle {
   @JS()
   external int write(TypedData buffer, [FileSystemReadWriteOptions? options]);
 
-  @JS()
-  external void truncate(int newSize);
+  @JS('truncate')
+  external Object? _truncate(int newSize);
+
+  @JS('truncate')
+  external void truncateSync(int newSize);
 
   @JS()
-  external int getSize();
+  external Object getSize();
+
+  @JS('getSize')
+  external int getSizeAsInt();
+
+  Future<void> truncate(int newSize) {
+    final nativeOp = _truncate(newSize);
+    if (nativeOp != null) {
+      return promiseToFuture(nativeOp);
+    } else {
+      return Future.value();
+    }
+  }
 }

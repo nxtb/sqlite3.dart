@@ -1,3 +1,4 @@
+import 'dart:html';
 import 'dart:typed_data';
 
 import 'package:meta/meta.dart';
@@ -46,20 +47,25 @@ class OpfsFileSystem implements FileSystem {
   // that no new async open needs to happen when these callbacks are invoked by
   // sqlite3.
   // We open a sync file for each stored file ([FileType]), plus a meta file
-  // file handle that describes whether files exist or not. Handles for stored
-  // files just store the raw data directly. The meta file is a 2-byte file
-  // storing whether the database or the journal file exists. By storing this
-  // information in a secondary file, we avoid the problem of having to query
-  // the FileSystem Access API to check whether a file exists, which can only be
-  // done asynchronously.
-
-  final FileSystemSyncAccessHandle _metaHandle;
+  // file handle that describes whether a file exists and what length it has.
+  // This meta handle is necessary because, despite the standard saying that the
+  // methods should be synchronous, `truncate`and `getSize` are asynchronous
+  // JavaScript methods in Chrome and Safari.
+  // Handles for stored files just store the raw data directly. The layout of
+  // meta file is described in [_MetaInformation].
+  final _MetaInformation _metaInformation;
   final Map<FileType, FileSystemSyncAccessHandle> _files;
 
   final FileSystem _memory = FileSystem.inMemory();
-  final Uint8List _existsList = Uint8List(FileType.values.length);
 
-  OpfsFileSystem._(this._metaHandle, this._files);
+  // Whether close, flush, getSize and truncate are synchronous in the browser.
+  // An earlier version of the web specification described these as asynchronous
+  // and Safari still returns promises. Other browsers made them synchronous.
+  final bool underlyingApiIsSynchronous;
+
+  OpfsFileSystem._(FileSystemSyncAccessHandle meta, this._files,
+      this.underlyingApiIsSynchronous)
+      : _metaInformation = _MetaInformation(meta);
 
   /// Loads an [OpfsFileSystem] in the desired [path] under the root directory
   /// for OPFS as given by `navigator.storage.getDirectory()` in JavaScript.
@@ -95,17 +101,27 @@ class OpfsFileSystem implements FileSystem {
     }
 
     final meta = await open('meta');
-    meta.truncate(2);
+    await meta.truncate(_MetaInformation.totalSize);
     final files = {
       for (final type in FileType.values) type: await open(type.name)
     };
 
-    return OpfsFileSystem._(meta, files);
+    final getSizeOperation = meta.getSize();
+    bool isSynchronous;
+    if (getSizeOperation is int) {
+      isSynchronous = true;
+    } else {
+      await promiseToFuture<Object?>(getSizeOperation);
+      isSynchronous = false;
+    }
+
+    return OpfsFileSystem._(meta, files, isSynchronous);
   }
 
   void _markExists(FileType type, bool exists) {
-    _existsList[type.index] = exists ? 1 : 0;
-    _metaHandle.write(_existsList, FileSystemReadWriteOptions(at: 0));
+    _metaInformation
+      ..setFileExists(type, exists)
+      ..write();
   }
 
   FileType? _recognizeType(String path) {
@@ -117,9 +133,9 @@ class OpfsFileSystem implements FileSystem {
     _memory.clear();
 
     for (final entry in _files.keys) {
-      _existsList[entry.index] = 0;
+      _metaInformation.setFileExists(entry, false);
     }
-    _metaHandle.write(_existsList, FileSystemReadWriteOptions(at: 0));
+    _metaInformation.write();
   }
 
   @override
@@ -134,16 +150,24 @@ class OpfsFileSystem implements FileSystem {
             'supported!',
       );
     } else {
-      _metaHandle.read(_existsList, FileSystemReadWriteOptions(at: 0));
-      final exists = _existsList[type.index] != 0;
+      _metaInformation.read();
+      final exists = _metaInformation.fileExists(type);
 
       if ((exists && errorIfAlreadyExists) || (!exists && errorIfNotExists)) {
         throw FileSystemException();
       }
 
       if (!exists) {
-        _markExists(type, true);
-        _files[type]!.truncate(0);
+        _metaInformation
+          ..setFileExists(type, true)
+          ..setFileSize(type, 0)
+          ..write();
+
+        if (underlyingApiIsSynchronous) {
+          // If we have a synchronous FS api, we can use truncate directly.
+          // Otherwise we'd have to await it which we cannot do here.
+          _files[type]!.truncate(0);
+        }
       }
     }
   }
@@ -169,19 +193,18 @@ class OpfsFileSystem implements FileSystem {
     if (type == null) {
       return _memory.exists(path);
     } else {
-      _metaHandle.read(_existsList, FileSystemReadWriteOptions(at: 0));
-      return _existsList[type.index] != 0;
+      _metaInformation.read();
+      return _metaInformation.fileExists(type);
     }
   }
 
   @override
   List<String> get files {
-    final existsStats = Uint8List(FileType.values.length);
-    _metaHandle.read(existsStats, FileSystemReadWriteOptions(at: 0));
+    _metaInformation.read();
 
     return [
       for (final type in FileType.values)
-        if (existsStats[type.index] != 0) type.filePath,
+        if (_metaInformation.fileExists(type)) type.filePath,
       ..._memory.files,
     ];
   }
@@ -192,7 +215,25 @@ class OpfsFileSystem implements FileSystem {
     if (type == null) {
       return _memory.read(path, target, offset);
     } else {
-      return _files[type]!.read(target, FileSystemReadWriteOptions(at: offset));
+      final handle = _files[type]!;
+      Uint8List adaptedTarget;
+
+      if (underlyingApiIsSynchronous) {
+        adaptedTarget = target;
+      } else {
+        // Since truncate is asynchronous, it may be that the file as seen by
+        // the browser is larger than we want it to be.
+        final length = _metaInformation.fileSize(type);
+        final bytesAvailable = length - offset;
+        if (bytesAvailable > target.length) {
+          adaptedTarget =
+              target.buffer.asUint8List(target.offsetInBytes, bytesAvailable);
+        } else {
+          adaptedTarget = target;
+        }
+      }
+
+      return handle.read(adaptedTarget, FileSystemReadWriteOptions(at: offset));
     }
   }
 
@@ -202,17 +243,38 @@ class OpfsFileSystem implements FileSystem {
     if (type == null) {
       return _memory.sizeOfFile(path);
     } else {
-      return _files[type]!.getSize();
+      // getSize() is asynchronous in some browsers, but we need a synchronous
+      // API. We cache this information in _metaInformation to support this
+      // otherwise.
+      if (underlyingApiIsSynchronous) {
+        return _files[type]!.getSizeAsInt();
+      } else {
+        return _metaInformation.fileSize(type);
+      }
     }
   }
 
   @override
   void truncateFile(String path, int length) {
     final type = _recognizeType(path);
+
     if (type == null) {
       _memory.truncateFile(path, length);
     } else {
-      _files[type]!.truncate(length);
+      if (underlyingApiIsSynchronous) {
+        _files[type]!.truncateSync(length);
+      } else {
+        final oldSize = _metaInformation.fileSize(type);
+        if (oldSize < length) {
+          // The truncate operation adds a bunch of zeroes at the end
+          final zeroes = Uint8List(length - oldSize);
+          _files[type]!.write(zeroes, FileSystemReadWriteOptions(at: oldSize));
+        }
+      }
+
+      _metaInformation
+        ..setFileSize(type, length)
+        ..write();
     }
   }
 
@@ -223,13 +285,74 @@ class OpfsFileSystem implements FileSystem {
       _memory.write(path, bytes, offset);
     } else {
       _files[type]!.write(bytes, FileSystemReadWriteOptions(at: offset));
+
+      if (!underlyingApiIsSynchronous) {
+        // This write could have changed the actual file size, which needs to
+        // be adopted now.
+        final oldSize = _metaInformation.fileSize(type);
+        final end = offset + bytes.length;
+
+        if (end > oldSize) {
+          _metaInformation
+            ..setFileSize(type, end)
+            ..write();
+        }
+      }
     }
   }
 
-  void close() {
-    _metaHandle.close();
+  Future<void> close() async {
+    _metaInformation._metaHandle.close();
+
     for (final entry in _files.values) {
       entry.close();
     }
+  }
+}
+
+class _MetaInformation {
+  // 8 bytes for each file. First byte is a 0/1 describing whether the file
+  // exists. Then there are three unused bytes, followed by an int32 (in big
+  // endian order) describing the length of the file.
+  static const _entrySize = 8;
+  static final totalSize = _entrySize * FileType.values.length;
+
+  final Uint8List _data;
+  final ByteData _byteData;
+
+  final FileSystemSyncAccessHandle _metaHandle;
+
+  _MetaInformation._(this._metaHandle, this._data, this._byteData);
+
+  factory _MetaInformation(FileSystemSyncAccessHandle meta) {
+    final bytes = Uint8List(_entrySize * FileType.values.length);
+    return _MetaInformation._(meta, bytes, bytes.buffer.asByteData());
+  }
+
+  void read() {
+    _metaHandle.read(_data, FileSystemReadWriteOptions(at: 0));
+  }
+
+  void write() {
+    _metaHandle.write(_data, FileSystemReadWriteOptions(at: 0));
+  }
+
+  bool fileExists(FileType type) {
+    return _data[_entrySize * type.index] != 0;
+  }
+
+  void setFileExists(FileType type, bool exists) {
+    _data[_entrySize * type.index] = exists ? 1 : 0;
+    if (!exists) {
+      setFileSize(type, 0);
+    }
+  }
+
+  int fileSize(FileType type) {
+    return _byteData.getInt32(_entrySize * type.index + 4);
+  }
+
+  void setFileSize(FileType type, int size) {
+    return _byteData.setInt32(_entrySize * type.index + 4, size);
   }
 }
